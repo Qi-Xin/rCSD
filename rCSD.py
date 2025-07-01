@@ -9,6 +9,10 @@ import copy
 from matplotlib.pyplot import grid
 import numpy as np
 from forward_models import b_fwd_1d
+import multiprocessing
+import os
+from tqdm import tqdm
+PROCESSES = os.cpu_count()-2
 
 def cross_validation_single(y, z,x, intervals_csd, para_name, para_range, my_dicts):
     Cv_Rep_Trial = 24
@@ -178,7 +182,7 @@ def region_conservation_frame(y, A, mat_region, mat_diff, csd_ini, lam_smooth, l
 
         if non_update >= 3:
             break
-    
+
     nloop = 1000
     csd_record = np.zeros((nz, nloop))
     # update immediately
@@ -233,12 +237,14 @@ def region_conservation_frame(y, A, mat_region, mat_diff, csd_ini, lam_smooth, l
     return csd_best.squeeze()
 
 
+
+
 class rCSD:
     def __init__(
             self, 
             Y, 
-            z_loc, 
-            y_loc, 
+            z, 
+            x, 
             R=None, 
             boundary_depth=[], 
             lam_smooth=None, 
@@ -248,10 +254,10 @@ class rCSD:
         self.Y = Y
         if self.Y.ndim == 2:
             self.Y = self.Y[:, :, None]
-        self.z_loc = z_loc
-        self.y_loc = y_loc
-        self.nz = z_loc.shape[0]
-        self.nx = y_loc.shape[0]
+        self.z = z
+        self.x = x
+        self.nz = z.shape[0]
+        self.nx = self.x.shape[0]
         self.nt = Y.shape[1]
         self.ntrial = Y.shape[2]
 
@@ -262,11 +268,11 @@ class rCSD:
         self.lam_lasso = lam_lasso
         if self.R is not None:
             # shape of A: (ny, nz)
-            self.A = b_fwd_1d(self.z_loc.T-self.y_loc, self.R)
+            self.A = b_fwd_1d(self.z.T-self.x, self.R)
         else:
             self.A = None
         self.boundary = [0] + [
-            np.nonzero(self.z_loc > self.boundary_depth[i])[0][0] 
+            np.nonzero(self.z > self.boundary_depth[i])[0][0] 
             for i in range(len(self.boundary_depth))
         ] + [self.nz]
         self.nregion = len(self.boundary) - 1
@@ -281,30 +287,98 @@ class rCSD:
         identity = np.eye(self.nz-1)
         self.mat_diff = np.block([identity, zeros_col]) - np.block([zeros_col, identity])
 
-    def search_hyperparameter(self):
-        pass
+    def cv_electrode(self, rep=10, return_var=False, verbose=True):
+        A_ori, Y_ori = self.A, self.Y
+        errors = []
+        del_electrode_list = np.random.choice(range(1, self.nx-1), rep, replace=False)
+        for del_electrode in tqdm(del_electrode_list, disable=not verbose):
+            self.A = np.delete(A_ori, del_electrode, axis=0)
+            self.Y = np.delete(Y_ori, del_electrode, axis=0)
+            csd_temp = self.predict(verbose=False)
+            lfp_pred = np.einsum('xz,ztm->xtm', self.A, csd_temp)
+            errors.append(np.mean((Y_ori[del_electrode, :, :] - lfp_pred[del_electrode, :, :] )**2))
+        self.A, self.Y = A_ori, Y_ori
+        if return_var:
+            return np.mean(errors), np.var(errors)/np.sqrt(len(errors))
+        else:
+            return np.mean(errors)
+    
+    def update_hp(self, dic):
+        self.R, self.lam_lasso, self.lam_region, self.lam_smooth = (
+            dic["R"], dic["lam_lasso"], dic["lam_region"], dic["lam_smooth"]
+        )
+        self.A = b_fwd_1d(self.z.T-self.x, self.R)
+    
+    def get_hp_dic(self):
+        dic = {}
+        dic["R"], dic["lam_lasso"], dic["lam_region"], dic["lam_smooth"] = (
+            self.R, self.lam_lasso, self.lam_region, self.lam_smooth
+        )
+        return dic
 
-    def predict(self, lr=1e-3, mu=1e-3, verbose=False):
+    def cv_para(self, para_name, para_range, dic, rep=10):
+        err_list, var_list = [], []
+        hp_dic_ori = self.get_hp_dic()
+        for para in tqdm(para_range):
+            dic[para_name] = para
+            self.update_hp(dic)
+            err, var = self.cv_electrode(rep=rep, return_var=True, verbose=False)
+            err_list.append(err)
+            var_list.append(var)
+        self.update_hp(hp_dic_ori)
+        return err_list, var_list
+
+    def predict(self, lr=1e-3, mu=1e-3, verbose=False, parallel=False):
         pred = np.zeros((self.nz, self.nt, self.ntrial))
-        for trial in range(self.ntrial):
-            pred[:, :, trial] = self.pred_rcsd_per_trial(
-                lr=lr, mu=mu,
-            )
+        if parallel:
+            with multiprocessing.Pool(processes=PROCESSES) as pool:
+                results = [
+                    pool.apply_async(
+                        self.pred_rcsd_per_trial,
+                        (itrial, )
+                    ) for itrial in range(self.ntrial)
+                ]
+
+            [result.wait() for result in results]
+            for itrial, result in enumerate(results):
+                pred[:,:,itrial] = result.get()
+        else:
+            for trial in tqdm(range(self.ntrial), desc="Predicting rCSD", disable=not verbose):
+                pred[:, :, trial] = self.pred_rcsd_per_trial(
+                    trial=trial, lr=lr, mu=mu,
+                )
+        self.pred = pred
         return pred
 
-    def pred_rcsd_per_trial(self, lr=1e-4, mu=1e-4, verbose=False):
+    def pred_rcsd_per_trial(self, trial=0, lr=1e-4, mu=1e-4, verbose=False):
         pred = np.zeros((self.nz, self.nt))
-        prev_csd = np.zeros((self.nz, 1))
+        prev_csd = np.zeros((self.nz))
         for t in range(self.nt):
+            # pred[:, t] = region_conservation_frame(
+            #     self.Y[:, t, trial], self.A, self.mat_region.T, self.mat_diff, 
+            #     prev_csd, self.lam_smooth, self.lam_region, self.lam_lasso,
+            # )
             pred[:, t] = pred_rcsd_per_time(
-                self.Y[:, t], self.A, self.mat_region, self.mat_diff,
+                self.Y[:, t, trial], self.A, self.mat_region, self.mat_diff,
                 prev_csd, self.lam_smooth, self.lam_region, self.lam_lasso,
                 lr=lr, mu=mu,
             )
-            if verbose:
-                print('Frame being proccessing:', t)
             prev_csd = pred[:, t]
         return pred
+
+    def predict_old_implementation(self,):
+        Y_smo = self.Y
+        R = self.R
+        A = b_fwd_1d(self.z.T-self.x, R)
+        self.old_rcsd_pred = region_conservation_multiple_trial(
+            Y_smo, A, np.array(self.boundary), self.lam_smooth, self.lam_region, self.lam_lasso
+        )
+        return self.old_rcsd_pred
+    
+    def get_difference(self):
+        diff = np.linalg.norm(self.pred - self.predict_old_implementation())
+        rel_diff = diff / np.linalg.norm(self.pred)
+        print(f"Difference between old and new rCSD: {rel_diff}")
 
 def get_approx_loss_and_grad(
         z, y, A, mat_region, mat_diff, lam_smooth, lam_region, lam_lasso, 
@@ -336,6 +410,156 @@ def get_loss(z, y, A, mat_region, mat_diff, lam_smooth, lam_region, lam_lasso):
         + lam_region/2*np.linalg.norm(mat_region@z)**2 \
         + lam_lasso*np.linalg.norm(z, 1)
     return loss
+
+
+
+
+def pred_rcsd_per_time(
+        y, 
+        A, 
+        mat_region, 
+        mat_diff, 
+        z_ini, 
+        lam_smooth, 
+        lam_region, 
+        lam_lasso,
+        lr=1e-3,
+        mu=1e-3,
+        tol=1e-4,
+        max_iter_tol=5,
+        max_iter=int(1e3),
+        Huber_approx=True,
+        Lasso_exact=True,
+    ):
+    # A few key point in the optimization algorithm:
+    
+    # First part update all coefficients simultaneously. 
+    # nloop: maximum iteration; 
+    # nDichotomy: search steps = 1/2**iDichotomy (nDichotomy is maximum of iDichotomy)
+    
+    # Second part update all coefficients immediately (greedy)
+    # non_update: if the nonzero coefficients doesn't change for some iteration, it stops
+    
+    ny, nz = A.shape
+    # if y.ndim == 1:
+    #     y = y[:,None]
+    # if z_ini.ndim == 1:
+    #     z_ini = z_ini[:,None]
+
+    if Huber_approx:
+        z_ini = pred_rcsd_per_time_approx(
+            y, A, mat_region, mat_diff, z_ini, lam_smooth, lam_region, lam_lasso,
+            lr_init=lr, mu=mu, tol=tol, max_iter_tol=max_iter_tol, max_iter=max_iter,
+        )
+    if not Lasso_exact:
+        return z_ini.squeeze()
+    
+    # return region_conservation_frame(y, A, mat_region.T, mat_diff, z_ini, lam_smooth, lam_region, lam_lasso)
+
+    csd_best = copy.deepcopy(z_ini)
+    csd_temp = copy.deepcopy(z_ini)
+    csd_best_value = np.inf
+    csd_temp_value = np.inf
+    csd_record = np.zeros((nz, max_iter))
+    csd_record[:, 0] = z_ini.squeeze()
+    non_update_iter = 0
+
+    # # update simultaneously
+    # max_iter_simul = 10
+    # non_update_iter = 0
+    # for iter in range(1, max_iter_simul):
+    #     update_weight = np.zeros((nz, 1))
+    #     csd_temp = csd_record[:, iter-1]
+    #     for iz in range(nz):
+    #         new_value = coordinate_descent(
+    #             iz, csd_temp, y, A, mat_region, lam_smooth, lam_region, lam_lasso
+    #         )
+    #         update_weight[iz] = new_value - csd_temp[iz]
+        
+    #     # search for the best value in current direction (1/2 step, 1/4 step, 1/8 step ...)
+    #     nDichotomy = 10
+    #     csd_search_value = np.nan*np.zeros(nDichotomy)
+    #     csd_search_value[0] = np.inf
+    #     for iDichotomy in range(1,nDichotomy):
+    #         csd_temp = csd_record[:, iter-1] + 1/2**iDichotomy*update_weight.squeeze()
+    #         csd_search_value[iDichotomy] = get_loss(
+    #             csd_temp, y, A, mat_region, mat_diff, lam_smooth, lam_region, lam_lasso
+    #         )
+    #         if csd_search_value[iDichotomy] > csd_search_value[iDichotomy-1]:
+    #             csd_temp = csd_record[:, iter-1] + 1/2**(iDichotomy-1)*update_weight.squeeze()
+    #             break
+        
+    #     csd_record[:, iter] = csd_temp.squeeze()
+    #     if csd_search_value[iDichotomy] <= csd_best_value:
+    #         csd_best_value = csd_search_value[iDichotomy-1]
+    #         csd_best = copy.deepcopy(csd_temp)
+    #         non_update_iter = 0
+    #     else:
+    #         non_update_iter += 1
+
+    #     if non_update_iter >= 3:
+    #         break
+
+    # update immediately
+    non_update_iter = 0
+    csd_record = np.zeros((nz, max_iter))
+    for iter in range(1, max_iter):
+        csd_temp = copy.deepcopy(csd_best)
+        for iz in range(nz):
+            new_value = coordinate_descent(
+                iz, csd_temp, y, A, mat_region, lam_smooth, lam_region, lam_lasso
+            )
+            csd_temp[iz] = new_value
+
+        csd_record[:, iter] = csd_temp.squeeze()
+
+        csd_temp_value = get_loss(
+            csd_temp, y, A, mat_region, mat_diff, lam_smooth, lam_region, lam_lasso
+        )
+        
+        if csd_temp_value < csd_best_value:
+            csd_best = copy.deepcopy(csd_temp)
+            csd_best_value = csd_temp_value
+            
+        if all((csd_record[:, iter]==0)==(csd_record[:, iter-1]==0)):
+            non_update_iter += 1
+        else:
+            non_update_iter = 0
+
+        if non_update_iter >= 5:
+            break
+
+
+    return csd_best.squeeze()
+
+
+def coordinate_descent(iz, csd_temp, y, A, mat_region, lam_smooth, lam_region, lam_lasso):
+    nz = csd_temp.shape[0]
+
+    rho = 0
+    iregion = np.where(mat_region[:, iz])[0][0]
+    csd_mask_j = copy.deepcopy(csd_temp)
+    csd_mask_j[iz] = 0
+
+    if iz == 0:
+        rho += lam_smooth*(csd_temp[1])
+    elif iz == nz-1:
+        rho += lam_smooth*(csd_temp[nz-2])
+    else:
+        rho += lam_smooth*(csd_temp[iz-1] + csd_temp[iz+1])
+    rho += -lam_region*(mat_region[iregion, :]*csd_mask_j).sum()
+    rho += (A[:, iz]*(y-A@csd_mask_j)).sum()
+    k = 2*lam_smooth + lam_region + np.linalg.norm(A[:, iz])**2
+
+    if rho < -lam_lasso:
+        new_value = (rho+lam_lasso)/k
+    elif rho > lam_lasso:
+        new_value = (rho-lam_lasso)/k
+    else:
+        new_value = 0
+
+    return new_value
+
 
 def pred_rcsd_per_time_approx(
         y, 
@@ -392,96 +616,3 @@ def pred_rcsd_per_time_approx(
                 break
     
     return best_z
-
-
-def pred_rcsd_per_time(
-        y, 
-        A, 
-        mat_region, 
-        mat_diff, 
-        z_ini, 
-        lam_smooth, 
-        lam_region, 
-        lam_lasso,
-        lr=1e-3,
-        mu=1e-3,
-        tol=1e-4,
-        max_iter_tol=5,
-        max_iter=int(1e3),
-    ):
-    # A few key point in the optimization algorithm:
-    
-    # First part update all coefficients simultaneously. 
-    # nloop: maximum iteration; 
-    # nDichotomy: search steps = 1/2**iDichotomy (nDichotomy is maximum of iDichotomy)
-    
-    # Second part update all coefficients immediately (greedy)
-    # non_update: if the nonzero coefficients doesn't change for some iteration, it stops
-    
-    ny, nz = A.shape
-    if y.ndim == 1:
-        y = y[:,None]
-    if z_ini.ndim == 1:
-        z_ini = z_ini[:,None]
-
-    z_ini = pred_rcsd_per_time_approx(
-        y, A, mat_region, mat_diff, z_ini, lam_smooth, lam_region, lam_lasso,
-        lr_init=lr, mu=mu, tol=tol, max_iter_tol=max_iter_tol, max_iter=max_iter,
-    )
-    # return z_ini.squeeze()
-
-    csd_best = copy.deepcopy(z_ini)
-    csd_temp = copy.deepcopy(z_ini)
-    csd_best_value = np.inf
-    csd_temp_value = np.inf
-    csd_record = np.zeros((nz, max_iter))
-    csd_record[:, 0] = z_ini.squeeze()
-    non_update_iter = 0
-
-    # update immediately
-    for iter in range(1, max_iter):
-        csd_temp = copy.deepcopy(csd_best)
-        for iz in range(nz):
-            rho = 0
-            iregion = np.where(mat_region[:, iz])[0][0]
-            csd_mask_j = copy.deepcopy(csd_temp)
-            csd_mask_j[iz] = 0
-
-            if iz == 0:
-                rho += lam_smooth*(csd_temp[1])
-            elif iz == nz-1:
-                rho += lam_smooth*(csd_temp[nz-2])
-            else:
-                rho += lam_smooth*(csd_temp[iz-1] + csd_temp[iz+1])
-            rho += -lam_region*(mat_region[iregion, :]*csd_mask_j).sum()
-            rho += (A[:, iz]*(y-A@csd_mask_j)).sum()
-            k = 2*lam_smooth + lam_region + np.linalg.norm(A[:, iz])**2
-
-            if rho < -lam_lasso:
-                new_value = (rho+lam_lasso)/k
-            elif rho > lam_lasso:
-                new_value = (rho-lam_lasso)/k
-            else:
-                new_value = 0
-
-            csd_temp[iz] = new_value
-
-        csd_record[:, iter] = csd_temp.squeeze()
-
-        csd_temp_value = get_loss(
-            csd_temp, y, A, mat_region, mat_diff, lam_smooth, lam_region, lam_lasso
-        )
-        
-        if csd_temp_value < csd_best_value:
-            csd_best = copy.deepcopy(csd_temp)
-            csd_best_value = csd_temp_value
-            
-        if all((csd_record[:, iter]==0)==(csd_record[:, iter-1]==0)):
-            non_update_iter += 1
-        else:
-            non_update_iter = 0
-
-        if non_update_iter >= 5:
-            break
-
-    return csd_best.squeeze()
