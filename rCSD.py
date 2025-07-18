@@ -12,6 +12,7 @@ from forward_models import b_fwd_1d
 import multiprocessing
 import os
 from tqdm import tqdm
+from gpcsd.utility_functions import normalize
 PROCESSES = os.cpu_count()-2
 
 def cross_validation_single(y, z,x, intervals_csd, para_name, para_range, my_dicts):
@@ -287,21 +288,27 @@ class rCSD:
         identity = np.eye(self.nz-1)
         self.mat_diff = np.block([identity, zeros_col]) - np.block([zeros_col, identity])
 
-    def cv_electrode(self, rep=10, return_var=False, verbose=True):
+    def cv_electrode(self, rep=10, del_electrode_list=None, return_var=False, return_pred=False, 
+            verbose=True):
         A_ori, Y_ori = self.A, self.Y
         errors = []
-        del_electrode_list = np.random.choice(range(1, self.nx-1), rep, replace=False)
+        lfp_pred_rcd_rcsd = np.zeros_like(Y_ori)
+        if del_electrode_list is None:
+            del_electrode_list = np.random.choice(range(1, self.nx-1), rep, replace=False)
         for del_electrode in tqdm(del_electrode_list, disable=not verbose):
             self.A = np.delete(A_ori, del_electrode, axis=0)
             self.Y = np.delete(Y_ori, del_electrode, axis=0)
             csd_temp = self.predict(verbose=False)
-            lfp_pred = np.einsum('xz,ztm->xtm', self.A, csd_temp)
+            lfp_pred = normalize(np.einsum('xz,ztm->xtm', self.A, csd_temp))
+            lfp_pred_rcd_rcsd[del_electrode, :, :] = lfp_pred[del_electrode, :, :]
             errors.append(np.mean((Y_ori[del_electrode, :, :] - lfp_pred[del_electrode, :, :] )**2))
         self.A, self.Y = A_ori, Y_ori
+        to_return = [np.mean(errors)]
         if return_var:
-            return np.mean(errors), np.var(errors)/np.sqrt(len(errors))
-        else:
-            return np.mean(errors)
+            to_return.append(np.var(errors)/np.sqrt(len(errors)))
+        if return_pred:
+            to_return.append(lfp_pred_rcd_rcsd)
+        return to_return
     
     def update_hp(self, dic):
         self.R, self.lam_lasso, self.lam_region, self.lam_smooth = (
